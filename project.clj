@@ -6,4 +6,5 @@
   :dependencies [[org.clojure/clojure "1.9.0"]
                  [org.vladimir/utils-lib "0.1.0"]
                  [org.vladimir/ajax-lib "0.1.0"]]
-  :source-paths ["src/clj"])
+  :source-paths ["src/clj"]
+  :java-source-paths ["src/java"])

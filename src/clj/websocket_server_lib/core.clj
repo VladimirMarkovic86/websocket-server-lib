@@ -1,15 +1,30 @@
 (ns websocket-server-lib.core
   (:require [clojure.string :as cstring]
             [utils-lib.core :as utils]
-            [ajax-lib.http.status-code :refer [status-code]]
-            [ajax-lib.http.entity-header :as eh])
-  (:import [java.net ServerSocket]))
+            [ajax-lib.http.status-code :as stc
+                                       :refer [status-code]]
+            [ajax-lib.http.entity-header :as eh]
+            [ajax-lib.http.mime-type :as mt])
+  (:import [websocketserverlib RejectedExecutionHandlerWebSocketResponse]
+           [java.net ServerSocket]
+           [java.util.concurrent Executors]))
 
 (def main-thread
      (atom nil))
 
 (def server-socket
      (atom nil))
+
+(def running
+     (atom false))
+
+(def thread-pool-size 4)
+
+(def thread-pool
+     (atom nil))
+
+(def client-sockets
+     (atom #{}))
 
 (defn pow
   "Square of value"
@@ -36,10 +51,27 @@
   "Stop server"
   []
   (when (and @server-socket
-             @main-thread)
+             @main-thread
+             @running)
     (try
-      (.interrupt
+      (reset!
+        running
+        false)
+      (future-cancel
         @main-thread)
+      (doseq [client-socket @client-sockets]
+        (try
+          (.close
+            client-socket)
+          (catch Exception e
+            (println (.getMessage e))
+           ))
+       )
+      (swap!
+        client-sockets
+        empty)
+      (.shutdownNow
+        @thread-pool)
       (.close
         @server-socket)
       (catch Exception e
@@ -116,8 +148,8 @@
   [request]
   (pack-response
     request
-    (if (= (:upgrade request)
-         "websocket")
+    (if (and (= (:upgrade request)
+                "websocket"))
       (let [sec-websocket-key (:sec-websocket-key request)
             sec-websocket-accept (javax.xml.bind.DatatypeConverter/printBase64Binary
                                    (.digest
@@ -133,8 +165,10 @@
          :headers {"Connection" "Upgrade"
                    "Upgrade" "websocket"
                    "Sec-WebSocket-Accept" sec-websocket-accept}})
-      {:status 404}))
- )
+      {:status 404
+       :headers {"Content-Type" "text-plain"}
+       :body (str {:message "Operation not supported"})})
+   ))
 
 (defn decode-message
   "Decode message sent through websocket
@@ -143,7 +177,8 @@
   [encoded-bytes
    key-array]
   (let [message (atom [])]
-    (doseq [itr (range (count encoded-bytes))]
+    (doseq [itr (range
+                  (count encoded-bytes))]
       (swap!
         message
         conj
@@ -158,18 +193,15 @@
               0x3))
          ))
      )
-     (String.
-       (byte-array
-         @message)
-       "UTF-8"))
- )
+    @message))
 
 (defn encode-message
   "Encoding message to send it through websocket
   
    https://tools.ietf.org/html/rfc6455#section-5.2"
   [message
-   & [first-byte]]
+   & [first-byte
+      user-agent]]
   (let [first-byte (or first-byte
                        -127)
         key-el-one (unchecked-byte
@@ -192,31 +224,43 @@
                         (* (Math/random)
                            255))
                      )
-        key-array [key-el-one
-                   key-el-two
-                   key-el-three
-                   key-el-four]
-        message-bytes (.getBytes
-                        message
-                        "UTF-8")
-        encoded-message (atom [])]
-    (doseq [itr (range
-                  (count
-                    message-bytes))]
-      (swap!
-        encoded-message
-        conj
-        (bit-xor
-          (get
-            message-bytes
-            itr)
-          (get
-            key-array
-            (bit-and
-              itr
-              0x3))
-         ))
-     )
+        key-array (if user-agent
+                    []
+                    [key-el-one
+                     key-el-two
+                     key-el-three
+                     key-el-four])
+        message-bytes (if (= first-byte
+                             -120)
+                        (.getBytes
+                          (str
+                            "  "
+                            message)
+                          "UTF-8")
+                        (.getBytes
+                          message
+                          "UTF-8"))
+        encoded-message (if user-agent
+                          (atom message-bytes)
+                          (atom []))]
+    (when-not user-agent
+      (doseq [itr (range
+                    (count
+                      message-bytes))]
+        (swap!
+          encoded-message
+          conj
+          (bit-xor
+            (get
+              message-bytes
+              itr)
+            (get
+              key-array
+              (bit-and
+                itr
+                0x3))
+           ))
+       ))
     (let [message-count (count @encoded-message)
           ;debug (println message-count)
           length-bytes (cond
@@ -247,8 +291,10 @@
                                                 )]
                              ;(println third-byte)
                              ;(println fourth-byte)
-                             [(- 126
-                                 128)
+                             [(if user-agent
+                                126
+                                (- 126
+                                   128))
                               third-byte
                               fourth-byte])
                          (< (dec (pow 16))
@@ -350,8 +396,10 @@
                              ;(println eighth-byte)
                              ;(println nineth-byte)
                              ;(println tenth-byte)
-                             [(- 127
-                                 128)
+                             [(if user-agent
+                                127
+                                (- 127
+                                   128))
                               third-byte
                               fourth-byte
                               fifth-byte
@@ -361,8 +409,11 @@
                               nineth-byte
                               tenth-byte])
                          :else
-                         [(- message-count
-                             128)])
+                         [(if user-agent
+                            message-count
+                            (- message-count
+                               128))]
+                        )
           message-array (byte-array
                           (apply
                             conj
@@ -382,7 +433,8 @@
   
    https://tools.ietf.org/html/rfc6455#section-5.2"
   [second-byte
-   input-stream]
+   input-stream
+   user-agent]
   (case (int
           (+ second-byte
              (pow 7))
@@ -441,13 +493,211 @@
      ))
  )
 
+(defn read-till-fin-is-one
+  ""
+  [input-stream
+   user-agent]
+  (let [message (atom [])
+        fin-atom (atom 0)]
+    (while (not= @fin-atom
+                 1)
+      (let [w-first-byte (.read
+                           input-stream)
+            first-byte-binary (Long/toBinaryString
+                                w-first-byte)
+            first-byte-binary (let [first-byte-count (- 8
+                                                        (count first-byte-binary))
+                                    first-byte-atom (atom first-byte-binary)]
+                                (doseq [itr (range first-byte-count)]
+                                  (swap!
+                                    first-byte-atom
+                                    str
+                                    0))
+                                @first-byte-atom)
+            fin (.charAt
+                  first-byte-binary
+                  7)
+            rsv1 (.charAt
+                   first-byte-binary
+                   6)
+            rsv2 (.charAt
+                   first-byte-binary
+                   5)
+            rsv3 (.charAt
+                   first-byte-binary
+                   4)
+            opcode3 (if (= (.charAt
+                             first-byte-binary
+                             3)
+                           \1)
+                      (pow 3)
+                      0)
+            opcode2 (if (= (.charAt
+                             first-byte-binary
+                             2)
+                           \1)
+                      (pow 2)
+                      0)
+            opcode1 (if (= (.charAt
+                             first-byte-binary
+                             1)
+                           \1)
+                      (pow 1)
+                      0)
+            opcode0 (if (= (.charAt
+                             first-byte-binary
+                             0)
+                           \1)
+                      (pow 0)
+                      0)
+            opcode (int
+                     (+ opcode3
+                        opcode2
+                        opcode1
+                        opcode0))
+            second-byte (unchecked-byte
+                          (.read
+                            input-stream))
+            message-length (calculate-message-length
+                             second-byte
+                             input-stream
+                             user-agent)
+            key-vector [(unchecked-byte
+                          (.read
+                            input-stream))
+                        (unchecked-byte
+                          (.read
+                            input-stream))
+                        (unchecked-byte
+                          (.read
+                            input-stream))
+                        (unchecked-byte
+                          (.read
+                            input-stream))]
+            encoded-vector (atom [])]
+        ;(println (str key-vector))
+        ;(println "FIN" fin)
+        ;(println "RSV1" rsv1)
+        ;(println "RSV2" rsv2)
+        ;(println "RSV3" rsv3)
+        ;(println "OPCODE" opcode)
+        ;(println "Payload len" message-length)
+        (if user-agent
+          (swap!
+            fin-atom
+            +
+            (if (or (= opcode
+                       0)
+                    (= opcode
+                       1))
+              (* opcode
+                 1/2)
+              1))
+          (reset!
+            fin-atom
+            (read-string
+              (str fin))
+           ))
+        (doseq [itr (range message-length)]
+          (let [read-byte (.read
+                            input-stream)]
+            (swap!
+              encoded-vector
+              conj
+              (unchecked-byte
+                read-byte))
+           ))
+        (swap!
+          message
+          (fn [atom-value
+               param-value]
+            (apply
+              conj
+              atom-value
+              param-value))
+          (decode-message
+            @encoded-vector
+            key-vector))
+       ))
+   (String.
+     (byte-array
+       @message)
+     "UTF-8"))
+ )
+
+(defn accept-web-socket-request-subprocess
+  "Work with established websocket connection"
+  [routing-fn
+   client-socket
+   header-map-with-body]
+  (try
+    (let [sub-running (atom true)
+          input-stream (.getInputStream
+                         client-socket)
+          output-stream (.getOutputStream
+                          client-socket)
+          user-agent (:user-agent header-map-with-body)
+          user-agent (clojure.string/index-of
+                       user-agent
+                       "Chrome")]
+      (while @sub-running
+        (let [decoded-message (read-till-fin-is-one
+                                input-stream
+                                user-agent)
+              {request-method :request-method
+               request-uri :request-uri} header-map-with-body
+              request-start-line (str
+                                   "ws "
+                                   request-method
+                                   " "
+                                   request-uri)]
+          (routing-fn
+            request-start-line
+            (assoc
+              header-map-with-body
+              :websocket
+               {:websocket-message decoded-message
+                :websocket-output-fn (fn [server-message
+                                          & [first-byte]]
+                                       (try
+                                         (.write
+                                           output-stream
+                                           (encode-message
+                                             server-message
+                                             first-byte
+                                             user-agent))
+                                         (.flush
+                                           output-stream)
+                                         (when (= first-byte
+                                                  -120)
+                                           (reset!
+                                             sub-running
+                                             false)
+                                           (.close
+                                             client-socket)
+                                           (swap!
+                                             client-sockets
+                                             disj
+                                             client-socket))
+                                         (catch Exception e
+                                           (println (.getMessage e))
+                                          ))
+                                       nil)})
+           ))
+       ))
+    (catch Exception e
+      (println (.getMessage e))
+     ))
+ )
+
 (defn- accept-web-socket-request
   "Read websocket request bytes
    process parsed request,
    pass it through routing-fn defined on server side of application
    establish connection and send response"
   [routing-fn
-   client-socket]
+   client-socket
+   reject]
   (try
     (let [input-stream (.getInputStream
                          client-socket)
@@ -478,8 +728,11 @@
                                  body)
           response (handler-fn
                      header-map-with-body)
+          user-agent (:user-agent header-map-with-body)
           connect-message (encode-message
-                            "Здраво")
+                            "Здраво"
+                            nil
+                            user-agent)
           response (str
                      response
                      (eh/content-length)
@@ -489,172 +742,108 @@
           response-as-byte-array (.getBytes
                                    response
                                    "UTF-8")]
-       ;(println response)
-       (.write
-         output-stream
-         response-as-byte-array)
-       (.write
-         output-stream
-         connect-message)
-       (while true
-         (let [w-first-byte (.read
-                              input-stream)
-               first-byte-binary (Long/toBinaryString
-                                   w-first-byte)
-               first-byte-binary (let [first-byte-count (- 8
-                                                           (count first-byte-binary))
-                                       first-byte-atom (atom first-byte-binary)]
-                                   (doseq [itr (range first-byte-count)]
-                                     (swap!
-                                       first-byte-atom
-                                       str
-                                       0))
-                                   @first-byte-atom)
-               fin (.charAt
-                     first-byte-binary
-                     7)
-               rsv1 (.charAt
-                      first-byte-binary
-                      6)
-               rsv2 (.charAt
-                      first-byte-binary
-                      5)
-               rsv3 (.charAt
-                      first-byte-binary
-                      4)
-               opcode3 (if (= (.charAt
-                                first-byte-binary
-                                3)
-                              \1)
-                         (pow 3)
-                         0)
-               opcode2 (if (= (.charAt
-                                first-byte-binary
-                                2)
-                              \1)
-                         (pow 2)
-                         0)
-               opcode1 (if (= (.charAt
-                                first-byte-binary
-                                1)
-                              \1)
-                         (pow 1)
-                         0)
-               opcode0 (if (= (.charAt
-                                first-byte-binary
-                                0)
-                              \1)
-                         (pow 0)
-                         0)
-               opcode (int
-                        (+ opcode3
-                           opcode2
-                           opcode1
-                           opcode0))
-               second-byte (unchecked-byte
-                             (.read
-                               input-stream))
-               message-length (calculate-message-length
-                                second-byte
-                                input-stream)
-               key-vector [(unchecked-byte
-                             (.read
-                               input-stream))
-                           (unchecked-byte
-                             (.read
-                               input-stream))
-                           (unchecked-byte
-                             (.read
-                               input-stream))
-                           (unchecked-byte
-                             (.read
-                               input-stream))]
-               encoded-vector (atom [])]
-           ;(println (str key-vector))
-           ;(println "FIN" fin)
-           ;(println "RSV1" rsv1)
-           ;(println "RSV2" rsv2)
-           ;(println "RSV3" rsv3)
-           ;(println "OPCODE" opcode)
-           ;(println "Payload len" message-length)
-           (doseq [itr (range message-length)]
-             (let [read-byte (.read
-                               input-stream)]
-               (swap!
-                 encoded-vector
-                 conj
-                 (unchecked-byte
-                   read-byte))
-              ))
-           (let [{request-method :request-method
-                  request-uri :request-uri} header-map-with-body
-                 request-start-line (str
-                                      "ws "
-                                      request-method
-                                      " "
-                                      request-uri)]
-             (routing-fn
-               request-start-line
-               (assoc
-                 header-map-with-body
-                 :websocket
-                  {:websocket-message (decode-message
-                                        @encoded-vector
-                                        key-vector)
-                   :websocket-output-fn (fn [server-message
-                                             & [first-byte]]
-                                          (.write
-                                            output-stream
-                                            (encode-message
-                                              server-message
-                                              first-byte))
-                                          (when (= first-byte
-                                                   -120)
-                                            (throw
-                                              (Exception.
-                                                "Initiated websocket closing."))
-                                           ))}
-                ))
-            ))
-        ))
+      ;(println response)
+      (.write
+        output-stream
+        response-as-byte-array)
+      (.write
+        output-stream
+        connect-message)
+      (if reject
+        (.write
+          output-stream
+          (encode-message
+            (str
+              {:action "rejected"
+               :status "error"
+               :message "Try again later"})
+            -120
+            user-agent))
+        (accept-web-socket-request-subprocess
+          routing-fn
+          client-socket
+          header-map-with-body))
+     )
+    ;(println "Connection established")
     (catch Exception e
-      ;(println (.printStackTrace e))
       (println (.getMessage e))
-      (println "Socket closed"))
-   )
-  (println "Out of while"))
+     )
+    (finally
+      (.close
+        client-socket)
+      (swap!
+        client-sockets
+        disj
+        client-socket))
+   ))
+
+(defn- while-loop
+  "While loop of accepting and responding on clients websocket requests"
+  [routing-fn]
+  (try
+    (while @running
+      (let [client-socket (.accept
+                            @server-socket)]
+        (swap!
+          client-sockets
+          conj
+          client-socket)
+        (.execute
+          @thread-pool
+          (fn [& [reject]]
+            (accept-web-socket-request
+              routing-fn
+              client-socket
+              reject))
+         ))
+     )
+    (catch Exception e
+      (println (.getMessage e))
+     ))
+ )
 
 (defn start-server
   "Start websocket server"
   [routing-fn
    & [port]]
-  (open-server-socket
-    (or port
-        9000))
-  (if (or (nil? @main-thread)
-          (and (not (nil? @main-thread))
-               (not (.isAlive @main-thread))
-           ))
-    (let [while-task (fn []
-                       (try
-                         (while true
-                           (let [client-socket (.accept @server-socket)
-                                 task (fn []
-                                        (accept-web-socket-request
-                                          routing-fn
-                                          client-socket))]
-                             (.start (Thread. task))
-                            ))
-                         (catch Exception e
-                           (println (.getMessage e))
-                          ))
-                      )]
-      (reset!
-        main-thread
-        (Thread. while-task))
-      (.start
+  (try
+    (open-server-socket
+      (or port
+          9000))
+    (if (or (nil? @main-thread)
+            (and (not (nil? @main-thread))
+                 (future-cancelled?
+                   @main-thread)
+                 (future-done?
+                   @main-thread))
+         )
+      (do
+        (reset!
+          running
+          true)
+        (reset!
+          thread-pool
+          (java.util.concurrent.ThreadPoolExecutor.
+            thread-pool-size
+            thread-pool-size
+            0
+            java.util.concurrent.TimeUnit/MILLISECONDS
+            (java.util.concurrent.SynchronousQueue.))
+         )
+        (.setRejectedExecutionHandler
+          @thread-pool
+          (RejectedExecutionHandlerWebSocketResponse.))
+        (reset!
+          main-thread
+          (future
+            (while-loop
+              routing-fn))
+         )
+        (println "WebSocket server started")
         @main-thread)
-      (println "WebSocket server started"))
-    (println "WebSocket server already started"))
-  @main-thread)
+      (println "WebSocket server already started"))
+    (catch Exception e
+      (println (.getMessage e))
+     ))
+ )
 
