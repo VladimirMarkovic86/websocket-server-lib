@@ -26,6 +26,8 @@
 (def client-sockets
      (atom #{}))
 
+(def keep-alive-message-period 25)
+
 (defn pow
   "Square of value"
   [value]
@@ -639,7 +641,31 @@
           user-agent (:user-agent header-map-with-body)
           user-agent (clojure.string/index-of
                        user-agent
-                       "Chrome")]
+                       "Chrome")
+          keep-alive (atom true)
+          keep-alive-time-in-seconds (atom keep-alive-message-period)
+          keep-alive-thread
+           (future
+             (while @keep-alive
+               (while (< 0
+                         @keep-alive-time-in-seconds)
+                 (Thread/sleep 1000)
+                 (swap!
+                   keep-alive-time-in-seconds
+                   dec))
+               (.write
+                 output-stream
+                 (encode-message
+                   (str
+                     {:action "keep-alive"})
+                   nil
+                   user-agent))
+               (.flush
+                 output-stream)
+               (reset!
+                 keep-alive-time-in-seconds
+                 keep-alive-message-period))
+            )]
       (while @sub-running
         (let [decoded-message (read-till-fin-is-one
                                 input-stream
@@ -668,6 +694,9 @@
                                              user-agent))
                                          (.flush
                                            output-stream)
+                                         (reset!
+                                           keep-alive-time-in-seconds
+                                           keep-alive-message-period)
                                          (when (= first-byte
                                                   -120)
                                            (reset!
@@ -678,7 +707,15 @@
                                            (swap!
                                              client-sockets
                                              disj
-                                             client-socket))
+                                             client-socket)
+                                           (reset!
+                                             keep-alive
+                                             false)
+                                           (reset!
+                                             keep-alive-time-in-seconds
+                                             0)
+                                           (future-cancel
+                                             keep-alive-thread))
                                          (catch Exception e
                                            (println (.getMessage e))
                                           ))
