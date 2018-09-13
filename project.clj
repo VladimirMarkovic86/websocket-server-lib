@@ -8,3 +8,4 @@
                  [org.vladimir/ajax-lib "0.1.0"]]
   :source-paths ["src/clj"]
   :java-source-paths ["src/java"])
+
