@@ -5,8 +5,13 @@
                                        :refer [status-code]]
             [ajax-lib.http.entity-header :as eh]
             [ajax-lib.http.mime-type :as mt])
-  (:import [websocketserverlib RejectedExecutionHandlerWebSocketResponse]
+  (:import [websocket_server_lib RejectedExecutionHandlerWebSocketResponse]
            [java.net ServerSocket]
+           [javax.net.ssl SSLServerSocket
+                          KeyManagerFactory
+                          SSLContext]
+           [java.security KeyStore]
+           [java.io FileInputStream]
            [java.util.concurrent Executors]))
 
 (def main-thread
@@ -37,16 +42,70 @@
 
 (defn- open-server-socket
   "Open server socket for listening on particular port"
-  [port]
+  [port
+   & [{keystore-file-path :keystore-file-path
+       keystore-type :keystore-type
+       keystore-password :keystore-password
+       ssl-context :ssl-context}]]
   (when (or (nil? @server-socket)
             (and (not (nil? @server-socket))
                  (.isClosed @server-socket))
          )
-    (reset!
-      server-socket
-      (ServerSocket.
-        port))
-   )
+    (when (and keystore-file-path
+               keystore-password)
+      (try
+        (let [ks (KeyStore/getInstance
+                   (or keystore-type
+                       "JKS"))
+              ks-is (FileInputStream.
+                      keystore-file-path)
+              pass-char-array (char-array
+                                keystore-password)
+              void (.load
+                     ks
+                     ks-is
+                     pass-char-array)
+              kmf (KeyManagerFactory/getInstance
+                    (KeyManagerFactory/getDefaultAlgorithm))
+              sc (SSLContext/getInstance
+                   (or ssl-context
+                       "TLSv1.2"))
+              void (.init
+                     kmf
+                     ks
+                     pass-char-array)
+              void (.init
+                     sc
+                     (.getKeyManagers
+                       kmf)
+                     nil
+                     nil)
+              ssl-server-socket (.createServerSocket
+                                  (.getServerSocketFactory
+                                    sc)
+                                  port)]
+          (.setEnabledProtocols
+            ssl-server-socket
+            (into-array
+              ["TLSv1"
+               "TLSv1.1"
+               "TLSv1.2"
+               "SSLv3"]))
+          (reset!
+            server-socket
+            ssl-server-socket))
+        (catch Exception e
+          (println (.getMessage
+                     e))
+          ))
+     )
+    (when-not (and keystore-file-path
+                   keystore-password)
+      (reset!
+        server-socket
+        (ServerSocket.
+          port))
+     ))
   @server-socket)
 
 (defn stop-server
@@ -125,7 +184,8 @@
    response-map]
   (let [response (atom "")
         status-line (str
-                      (:request-protocol request)
+                      (or (:request-protocol request)
+                          "HTTP/1.1")
                       " "
                       (status-code
                         (:status response-map))
@@ -496,7 +556,7 @@
  )
 
 (defn read-till-fin-is-one
-  ""
+  "Read from input stream all messages till FIN bit has value 1 (one)"
   [input-stream
    user-agent]
   (let [message (atom [])
@@ -670,19 +730,19 @@
         (let [decoded-message (read-till-fin-is-one
                                 input-stream
                                 user-agent)
-              {request-method :request-method
-               request-uri :request-uri} header-map-with-body
-              request-start-line (str
-                                   "ws "
-                                   request-method
-                                   " "
-                                   request-uri)]
+              {request-method :request-method} header-map-with-body
+              header-map-with-body (assoc
+                                     header-map-with-body
+                                     :request-method
+                                     (str
+                                       "ws "
+                                       request-method))]
           (routing-fn
-            request-start-line
             (assoc
               header-map-with-body
               :websocket
                {:websocket-message decoded-message
+                :websocket-message-length (count decoded-message)
                 :websocket-output-fn (fn [server-message
                                           & [first-byte]]
                                        (try
@@ -738,17 +798,30 @@
   (try
     (let [input-stream (.getInputStream
                          client-socket)
+          first-byte (.read
+                       input-stream)
           available-bytes (.available
                             input-stream)
+          available-bytes (inc
+                            available-bytes)
           output-stream (.getOutputStream
                           client-socket)
+          request-vector (atom
+                           [first-byte])
+          read-stream (while (< (count
+                                  @request-vector)
+                                available-bytes)
+                        (let [read-byte (unchecked-byte
+                                          (.read
+                                            input-stream))]
+                          (swap!
+                            request-vector
+                            conj
+                            read-byte))
+                       )
           read-byte-array (byte-array
-                            available-bytes)
-          read-int (.read
-                     input-stream
-                     read-byte-array
-                     0
-                     available-bytes)
+                            available-bytes
+                            @request-vector)
           request (String.
                     read-byte-array
                     "UTF-8")
@@ -842,11 +915,13 @@
 (defn start-server
   "Start websocket server"
   [routing-fn
-   & [port]]
+   & [port
+      https-conf]]
   (try
     (open-server-socket
       (or port
-          9000))
+          9000)
+      https-conf)
     (if (or (nil? @main-thread)
             (and (not (nil? @main-thread))
                  (future-cancelled?
