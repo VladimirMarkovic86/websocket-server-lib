@@ -4,14 +4,14 @@
             [ajax-lib.http.status-code :as stc
                                        :refer [status-code]]
             [ajax-lib.http.entity-header :as eh]
-            [ajax-lib.http.mime-type :as mt])
+            [ajax-lib.http.mime-type :as mt]
+            [clojure.java.io :as io])
   (:import [websocket_server_lib RejectedExecutionHandlerWebSocketResponse]
            [java.net ServerSocket]
            [javax.net.ssl SSLServerSocket
                           KeyManagerFactory
                           SSLContext]
            [java.security KeyStore]
-           [java.io FileInputStream]
            [java.util.concurrent Executors]))
 
 (def main-thread
@@ -57,8 +57,9 @@
         (let [ks (KeyStore/getInstance
                    (or keystore-type
                        "JKS"))
-              ks-is (FileInputStream.
-                      keystore-file-path)
+              ks-is (io/input-stream
+                      (io/resource
+                        keystore-file-path))
               pass-char-array (char-array
                                 keystore-password)
               void (.load
