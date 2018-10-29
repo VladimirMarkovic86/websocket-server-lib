@@ -1,36 +1,19 @@
 # WebSocket server library
 
-WebSocket server library
+WebSocket server library is clojure project that implements websocket server, as listening on java ServerSocket and Socket, for ws and wss requests, and packing them into clojure maps and passing them as parameters to provided routing function. This functionality is now available in server-lib project also.
 
-## Installation
+### Installing
 
-Download from http://gitlab:1610/VladimirMarkovic86/websocket-server-lib.
+You can use this project as dependencie in clojure projects by listing it in project.clj
 
-## Usage
+```
+[org.clojars.vladimirmarkovic86/websocket-server-lib "0.1.0"]
+```
 
-FIXME: explanation
+## Authors
 
-    $ java -jar server-lib-0.1.0-standalone.jar [args]
-
-## Options
-
-FIXME: listing of options this app accepts.
-
-## Examples
-
-...
-
-### Bugs
-
-...
-
-### Any Other Sections
-### That You Think
-### Might be Useful
+* **Vladimir Markovic** - [VladimirMarkovic86](https://github.com/VladimirMarkovic86)
 
 ## License
 
-Copyright © 2018 FIXME
-
-Distributed under the Eclipse Public License either version 1.0 or (at
-your option) any later version.
+This project is licensed under the Eclipse Public License 1.0 - see the [LICENSE](LICENSE) file for details
