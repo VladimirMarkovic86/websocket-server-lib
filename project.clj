@@ -1,4 +1,4 @@
-(defproject org.clojars.vladimirmarkovic86/websocket-server-lib "0.1.2"
+(defproject org.clojars.vladimirmarkovic86/websocket-server-lib "0.1.3"
   :description "WebSocket server library"
   :url "http://github.com/VladimirMarkovic86/websocket-server-lib"
   :license {:name "Eclipse Public License"
